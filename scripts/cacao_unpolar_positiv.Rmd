@@ -12,7 +12,7 @@ In this case the sript was used for unpolar_positiv data.
 
 Please have a look at the other specific scripts in terms of parameters.
 
-# packagess
+# packages
 ```{r packages, results="hide"}
 library(dplyr)
 library(ggplot2)
