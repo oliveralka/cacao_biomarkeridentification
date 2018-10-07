@@ -1,0 +1,924 @@
+---
+title: "cacao_polar_positiv"
+author: "Oliver Alka"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This script can be used for the analysis and the random forest of one specific group (polar_positiv, polar_negativ, ...)
+
+In this case the sript was used for polar_positiv data. 
+
+Please have a look at the other specific scripts in terms of parameters.
+
+# packagess
+```{r packages, results="hide"}
+library(dplyr)
+library(ggplot2)
+library(ggfortify)
+library(devtools)
+library(ggbiplot)
+library(robustbase)
+```
+
+# paramters 
+```{r param}
+# folder with data
+filepath <- "/Volumes/Transfer/20180503_cacao/analyse_2/polar_positiv/"
+
+# from ExtractConsensusXML
+inputfile <- "centroided_QJEVB791AS__Blank_NTP_pos_RA1_01_2348_to_centroided_QJEVB922AX__Roest_7_mrgd.csv"
+
+# from getNamesConsensusXML (python)
+barcodefile <- "centroided_QJEVB791AS__Blank_NTP_pos_RA1_01_2348_to_centroided_QJEVB922AX__Roest_7_mrgd_python_names.csv"
+
+# file with barcodes and metadata used for metadata-registration
+registrationfile <- "Herkunftsproben+und+Röstreihe+NTP+pos_with_barcodes.tsv"
+
+# mapping with "type" for pca and randomforest
+# please name the ID column: all
+# please name the other column: Probenart
+# two mappings possible (used: ID-Probenart; ID-Probenart_Herkunft)
+filepath_mapping = "mapping_probenart.csv"
+filepath_mapping_2 = "mapping_herkunft_probenart.csv"
+
+# filters applied after normalization
+filterNonFermented = F
+filterRoest = F
+filterShellIntensity = T
+
+# calculate coefficient of variation
+coeff = T
+
+# filter applied before boruta and randomForestr
+filterqcblank = T
+
+# extract n top features based on importance # only if export for randomForest is used 
+top = 200
+
+# export plots
+bool_barplot <- T
+bool_boxplot <- T
+
+# export output with feature selection via boruta
+export = T
+export_boruta = T
+```
+
+# input
+```{r input}
+input <- read.csv(paste(filepath, inputfile , sep=""), header = TRUE)
+input[input == 0.0] <- NA
+rownames(input) <- paste("feature","mz",round(input$mz_cf, digits = 4),"rt",round(input$rt_cf, digits = 4), sep = "_")
+```
+
+# rename intensity columns
+```{r rename intensity columns}
+
+# extract intensity columns
+all_cols <- input
+intensity_cols <- all_cols[grepl("intensity_\\d+", colnames(all_cols))]
+
+# used for filenames 
+barcode <- read.csv(paste(filepath, barcodefile, sep=""), header = F, stringsAsFactors = F)
+registration <- read.csv(paste(filepath, registrationfile, sep=""), sep = "\t", stringsAsFactors = F)
+
+# rename colnames
+colnames(barcode) <- c("id", "barcode")
+
+# reduce registration set to Barcode & Analyte ID
+registration_sm <- data.frame(registration$QBiC.Code, registration$Analyte.ID)
+colnames(registration_sm) <- c("barcode","Analyte_ID")
+
+# reduce registration to used files in dataset (barcodes)
+registration_sm <- registration_sm[(registration_sm$barcode %in% barcode$barcode),]
+
+# droplevels & removefactors
+registration_sm <- droplevels(registration_sm)
+registration_sm <- remove.factors(registration_sm)
+
+# merge
+mergebr <- merge(barcode, registration_sm, by = "barcode")
+mergebr <- arrange(mergebr,id)
+
+mergebr["all"] <- apply(mergebr,1, function(x) paste0(x, collapse = "_"))
+
+colnames(intensity_cols) <- mergebr$all
+```
+
+# blank filter
+```{r blank filter}
+######## PARAMETER ########
+blankPattern = "Blank"
+samplePattern = ".\\dK_|.\\dS_"
+qcPattern = "QC"
+blankFilterPassed = 127 # (~30%)
+###########################
+
+# mapping feature mz_rt colnames mz_rt
+dataBlank <- intensity_cols[,grep(blankPattern,colnames(intensity_cols))]
+dataSamples <- intensity_cols[,grep(samplePattern,colnames(intensity_cols))]
+
+# median calculation Blank
+median_dataBlank <- as.data.frame(apply(dataBlank, 1, median, na.rm = T))
+
+difference <- as.data.frame(!is.na(median_dataBlank[,1]) & !is.na(dataSamples[,]) & dataSamples[,]*0.2 > median_dataBlank[,1] | is.na(median_dataBlank[,1]) & !is.na(dataSamples[,]))
+
+# filter how many values have to be true
+difference_filtered <- apply(difference, 1, function(x){ sum(x == TRUE) > blankFilterPassed})
+dataSamples_filtered <- intensity_cols[difference_filtered,]
+
+```
+
+# normalization
+```{r normalization}
+########## PARAMETERS #############
+ignoreColsPattern = c("_QC_", "Blank")
+method = "mean"
+outlier = c(0.68, 1/0.68)
+verbose = T
+###################################
+
+df <- dataSamples_filtered
+
+ignoredCols = c()
+norm_cols_ind = c()
+num_features = c()
+norm_ratios = c()
+
+if (method != "mean" & method != "median") {
+	error(paste("Illegal method:", method))
+}
+
+# Find map with most features
+for (i in 1:ncol(df)) {
+	num_features = append(num_features, nrow(df[!is.na(df[,i]) & df[,i] > 0,]))
+	
+	if (colnames(df)[i] %in% c("mz", "mz_cf", "RT", "rt", "rt_cf", "id", "accession")) { ignoredCols = append(ignoredCols, colnames(df)[i]); next }
+	
+	if (length(ignoreColsPattern) > 0) { 
+		ignoreColsMatches = FALSE
+		for (j in 1:length(ignoreColsPattern)) {
+			if (grepl(ignoreColsPattern[j], colnames(df)[i], ignore.case=TRUE)) ignoreColsMatches = TRUE
+		}
+		if (ignoreColsMatches) { ignoredCols = append(ignoredCols, colnames(df)[i]); next }
+	}
+	
+	norm_cols_ind = append(norm_cols_ind, i)
+}
+
+if (verbose)
+{
+	message("Non-normalized columns: ")
+	print(ignoredCols)
+}
+
+if (verbose) 
+{
+	message("Feature count:")
+}
+
+max_features = 0
+max_features_ind = 0
+for (i in 1:length(norm_cols_ind)) {
+	print(paste(colnames(df)[norm_cols_ind[i]], ": ", num_features[norm_cols_ind[i]], sep=""), quote=FALSE)
+	if (num_features[norm_cols_ind[i]] > max_features) {
+		max_features = num_features[norm_cols_ind[i]]
+		max_features_ind = norm_cols_ind[i]
+	}
+}
+if (max_features == 0) error("Error: No features found.")
+
+if (verbose) {
+	message("Most features:")
+	print(paste(colnames(df)[max_features_ind], ": ", num_features[max_features_ind], sep=""), quote=FALSE)
+}
+
+# Get normalization ratio
+if (verbose) {
+	message("Normalization ratios (map with most features / other map):")
+	message(paste("Method: ", method, sep=""))
+	message(paste("Outlier: ", format(outlier[1], digits=2), " < ratio < ", format(outlier[2], digits=2), sep=""))
+}
+for (i in 1:length(norm_cols_ind)) {
+	ratios = as.numeric(df[,max_features_ind]) / as.numeric(df[,norm_cols_ind[i]])
+	ratios = ratios[!is.na(ratios) & !is.infinite(ratios) & ratios > 0 & ratios > outlier[1] & ratios < outlier[2]]
+
+	if (method == "mean") {
+		m_ratio = mean(ratios, na.rm=TRUE)
+	}
+	else if (method == "median") {
+		m_ratio = median(ratios, na.rm=TRUE)
+	}
+	
+	norm_ratios = append(norm_ratios, m_ratio)
+}
+
+for (i in 1:length(norm_cols_ind)) {
+	df[,norm_cols_ind[i]] = as.numeric(df[,norm_cols_ind[i]]) * norm_ratios[i]
+}
+
+dataSamples_normalized <- df
+rownames(dataSamples_normalized) <- rownames(dataSamples_filtered)
+
+```
+
+# additional Filter (Röstreihe, shell intenisty, coefficent of variation)
+```{r additional Filter: no Röstreihe; Filter: shell intensity}
+
+if(filterNonFermented){
+nonfermPattern <- "PS\\d.\\d"
+dataSamples_normalized <- dataSamples_normalized[,-grep(nonfermPattern,colnames(dataSamples_normalized))]
+}
+
+if(filterRoest){
+roestPattern <- "_Roest_"
+dataSamples_normalized <- dataSamples_normalized[,-grep(roestPattern,colnames(dataSamples_normalized))]
+}
+
+if(filterqcblank){
+blankPattern = "Blank"
+qcPattern = "_QC_"
+
+dataSamples_normalized <- dataSamples_normalized[,-grep(blankPattern,colnames(dataSamples_normalized))]
+dataSamples_normalized <- dataSamples_normalized[,-grep(qcPattern,colnames(dataSamples_normalized))]
+}
+
+if(filterShellIntensity){
+shellPattern <- ".\\dS_"
+shell_norm <- dataSamples_normalized[, grep(shellPattern,colnames(dataSamples_normalized))]
+
+# should be the one from the core 
+shell_norm_na <- shell_norm[rowMeans(is.na(shell_norm)) > 0.99, ]
+
+higherint <- rowMedians(as.matrix(shell_norm),na.rm=T) > 0.8*10^5
+shell_norm_fil <- shell_norm[higherint, ] 
+
+# vector of rownames which are over 95% NA and/or have higher intenisty as 0.8*10^5
+shellna_fil <- c(rownames(shell_norm_na), rownames(shell_norm_fil))
+shellna_fil <- unique(shellna_fil)
+
+# get rows with the corresponding features
+dataSamples_normalized_shell <- dataSamples_normalized[rownames(dataSamples_normalized) %in% shellna_fil,]
+dataSamples_normalized <- dataSamples_normalized_shell
+}
+
+# calculate coefficient of variation 
+if (coeff)
+{
+  kernPattern = ".\\dK_"
+  schalePattern = ".\\dS_"
+
+  coeff_k <- dataSamples_normalized[ , grep(kernPattern, colnames(dataSamples_normalized))]
+  rownames(coeff_k) <- rownames(dataSamples_normalized)
+  
+  coeff_s <- dataSamples_normalized[ , grep(schalePattern, colnames(dataSamples_normalized))]
+  rownames(coeff_s) <- rownames(dataSamples_normalized)
+  
+  coeff_k$sd <- apply(coeff_k, 1, sd, na.rm = T)
+  coeff_k$rmean <- rowMeans(coeff_k, na.rm = T)
+  coeff_k$cv <- (coeff_k$sd/coeff_k$rmean) * 100
+  coeff_k$n_NA <- apply(coeff_k, 1, function(x) sum(is.na(x)))
+  
+  coeff_s$sd <- apply(coeff_s, 1, sd, na.rm = T)
+  coeff_s$rmean <- rowMeans(coeff_s, na.rm = T)
+  coeff_s$cv <- (coeff_s$sd/coeff_s$rmean) * 100
+  coeff_s$n_NA <- apply(coeff_s, 1, function(x) sum(is.na(x)))
+  
+  coeff_k <- coeff_k[, c((ncol(coeff_k)-3):ncol(coeff_k))]
+  coeff_s <- coeff_s[, c((ncol(coeff_s)-3):ncol(coeff_s))]
+  
+  coeff_a <- merge(coeff_k, coeff_s, by = "row.names")
+  rownames(coeff_a) <- coeff_a$Row.names
+  coeff_a$Row.names <- NULL
+  colnames(coeff_a) <- c("sd_k","rmean_k","cv_k","n_NA_k","sd_s","rmean_s","cv_s","n_NA_s")
+}
+```
+
+# add Mapping - PCA (log scaling + transpose + add labels)
+```{r mapping_1_probenart} 
+dataSamples_norm_ln <- log(dataSamples_normalized)
+
+# impute NA values as zero values
+dataSamples_norm_ln[is.na(dataSamples_norm_ln) == T] <- 0.0
+
+# transpose
+tdS_norm_ln <- as.data.frame(t(dataSamples_norm_ln))
+
+# add mapping 
+mappingfile <- read.csv(paste(filepath, filepath_mapping, sep = ""), header = TRUE)
+rownames(mappingfile) <- mappingfile$all
+
+# reduce set to rownames in knime_out
+mappingfile <- mappingfile[rownames(mappingfile) %in% rownames(tdS_norm_ln),]
+mappingfile$all <- NULL
+
+# merge
+tdS_norm_ln <- merge(tdS_norm_ln, mappingfile, by = "row.names")
+
+# workaround to save the rownames from knime out 
+rownames(tdS_norm_ln) <- tdS_norm_ln$Row.names
+tdS_norm_ln$Row.names <- NULL
+
+check <- data.frame(rownames(tdS_norm_ln),tdS_norm_ln$Probenart)
+
+```
+
+# pca
+```{r pca transposed (each kern/schale)}
+# The results of a PCA are usually discussed in terms of component scores, sometimes called factor scores (the transformed variable values corresponding to a particular data point), and loadings (the weight by which each standardized original variable should be multiplied to get the component score)
+
+pca <- as.data.frame(tdS_norm_ln)
+
+# no non-numeric values allowed in PCA 
+pca$Probenart<- NULL 
+
+#pca 
+pca_t<- prcomp(pca,
+               center = T, # standardize the variables prior to the application of PCA
+               scale. = T) # standardize the variables prior to the application of PCA
+
+# factors plot
+plot(pca_t, type = "l",
+     main="Factors for PC1 vs. PC2") # which makes the biggest difference (highest variance of PCA)
+summary(pca_t) # show importance of components
+
+autoplot(pca_t, data = tdS_norm_ln, colour = 'Probenart')
+
+plot_probenart <- autoplot(pca_t, 
+                           data = tdS_norm_ln, 
+                           colour = 'Probenart') +
+                           ggtitle("Hauptkomponentenanalyse Messreihenfolge (polar positiv)") +
+                           theme(plot.title = element_text(size = 10, hjust = 0.5),
+                                 axis.title.x = element_text(size = 8),
+                                 axis.title.y = element_text(size = 8))
+
+if(T){
+  ggsave("~/Desktop/pca_probenart_polar_positiv_chrom40_int600.png", plot = plot_probenart, width = 15, height = 7.5, units = "cm")
+}
+
+# loadings_plot
+plot(pca_t$rotation[,1], pca_t$rotation[,2],
+     main='Loadings for PC1 vs. PC2') 
+```
+
+# mapping_2
+```{r mapping_2_herkunft} 
+dataSamples_norm_ln <- log(dataSamples_normalized)
+
+# impute NA values as zero values
+dataSamples_norm_ln[is.na(dataSamples_norm_ln) == T] <- 0.0
+
+# transpose
+tdS_norm_ln_2 <- as.data.frame(t(dataSamples_norm_ln))
+
+# add mapping 
+mappingfile_2 <- read.csv(paste(filepath, filepath_mapping_2, sep = ""), sep = ",", header = TRUE)
+rownames(mappingfile_2) <- mappingfile_2$all
+
+# reduce set to rownames in knime_out
+mappingfile_2 <- mappingfile_2[rownames(mappingfile_2) %in% rownames(tdS_norm_ln_2),]
+mappingfile_3 <- mappingfile_2[rownames(mappingfile_2) %in% rownames(tdS_norm_ln_2),]
+mappingfile_2$all <- NULL
+
+# merge
+tdS_norm_ln_2 <- merge(tdS_norm_ln_2, mappingfile_2, by = "row.names")
+
+# workaround to save the rownames from knime out 
+rownames(tdS_norm_ln_2) <- tdS_norm_ln_2$Row.names
+tdS_norm_ln_2$Row.names <- NULL
+
+check_2 <- data.frame(rownames(tdS_norm_ln_2),tdS_norm_ln_2$Herkunft)
+```
+
+# pca_2 
+```{r pca transposed}
+pca <- as.data.frame(tdS_norm_ln_2)
+
+# no non-numeric values allowed in PCA 
+pca$Herkunft<- NULL 
+
+pca_t<- prcomp(pca,
+               center = T, # standardize the variables prior to the application of PCA
+               scale. = T) # standardize the variables prior to the application of PCA
+
+# factors plot
+plot(pca_t, type = "l",
+     main="Factors for PC1 vs. PC2") # which makes the biggest difference (highest variance of PCA)
+summary(pca_t) # show importance of components
+
+pca_plot <- ggbiplot(pca_t, obs.scale = 1, var.scale = 1.0,
+        groups = tdS_norm_ln_2$Herkunft, ellipse = F, circle = F, var.axes = FALSE) +
+        scale_color_discrete(name = '') +
+        theme_bw() +
+        theme(legend.direction = 'vertical', legend.position = 'right')
+
+if(T){
+  ggsave("pca_herkunft.png", plot = pca_plot, width = 15, height = 7.5, units = "cm")
+}
+
+autoplot(pca_t, data = tdS_norm_ln_2, colour = 'Herkunft')
+
+#loadings_plot 
+plot(pca_t$rotation[,1], pca_t$rotation[,2],
+     main='Loadings for PC1 vs. PC2') 
+```
+
+# kmeans clustering
+```{r kmeans clustering - probenart}
+
+df_kmeans <- tdS_norm_ln
+df_kmeans$Probenart <- NULL
+
+# Plot 
+fviz_pca_ind(prcomp(df_kmeans), title = "PCA", 
+             habillage = tdS_norm_ln$Probenart,  palette = "jco",
+             geom = "point", ggtheme = theme_classic(),
+             legend = "bottom")
+
+km <- kmeans(df_kmeans, 4, nstart=20)
+
+table(km$cluster, tdS_norm_ln$Probenart)
+```
+
+# decision tree
+```{r decision tree}
+library(partykit)
+set.seed(7) 
+
+tree <- ctree(Probenart ~ . , data = tdS_norm_ln) 
+forest <- cforest(factor(tdS_norm_ln$Probenart) ~ . , data = tdS_norm_ln)
+
+plot(tree)
+
+if(T)
+{
+  png("~/Desktop/Tree_polar_positiv_chrom40_int600.png", width = 1200, height = 1200)
+  plot(tree, gp = gpar(fontsize = 20), main = "Entscheidungsbaum (polar positiv)")
+  dev.off()
+}
+```
+
+# training and testing dataset
+```{r divide in training and testing dateset}
+library(caret)
+
+tdS_norm_ln <- droplevels(tdS_norm_ln)
+
+# split in training and testing dataset with taking replicates into account (Have to be either together in training or testing.)
+
+testPattern <- "_1\\.|_3\\.|_10\\.|_29\\.|_12\\.|_17\\.|_25\\.|_27\\.|_30\\.|_34\\.|_46\\.|_48\\.| _Roest_1\\.| _Roest_5\\."
+dftesting <- tdS_norm_ln[grep(testPattern,rownames(tdS_norm_ln)),]
+dftraining <- tdS_norm_ln[!rownames(tdS_norm_ln) %in% rownames(dftesting),] 
+
+print(paste0("Dataset: ", nrow(tdS_norm_ln)))
+print(paste0("Training: ", nrow(dftraining)))
+print(paste0("Testing: ", nrow(dftesting)))
+```
+
+# boruta
+```{r boruta}
+# feature selection algorithm (wrapper around random forest)
+# An all relevant feature selection wrapper algorithm. It finds relevant features by comparing original attributes' importance with importance achievable at random,
+# estimated using their permuted copies.
+
+# install.packages("Boruta")
+if(T)
+{
+  set.seed(7)
+  
+  # has to check if randomForest is loaded shadow method
+  if("randomForest" %in% (.packages()))
+  {
+    detach("package:randomForest", unload = T)
+  }
+
+  library(Boruta)
+  
+  # test performance 
+  boruta.train <- Boruta(factor(tdS_norm_ln$Probenart) ~., 
+                         data = tdS_norm_ln, 
+                         maxRuns = 1000, 
+                         doTrace = 2)
+  print(boruta.train)
+  
+  # decision on tentative attributes
+  boruta.final <- TentativeRoughFix(boruta.train)
+  print(boruta.final)
+  
+  # get Attributes
+  getSelectedAttributes(boruta.final, withTentative = F)
+  
+  # results
+  boruta.df <- attStats(boruta.final)   
+  
+  # extract features confirmed by boruta 
+  boruta.confirmed <- boruta.df[boruta.df$decision == "Confirmed",]
+  boruta.confirmed <- boruta.confirmed[order(-boruta.confirmed$meanImp),]
+  boruta.confirmed_export <- boruta.confirmed
+}
+```
+
+# plot boruta
+```{r plot_boruta}
+if(bool_boxplot || bool_barplot){
+    for (i in 1:length(rownames(boruta.confirmed_export))){
+    title <- rownames(boruta.confirmed_export)[i]
+    
+    # use tds_norm - instead
+    important_features_int <- as.data.frame(tdS_norm_ln[,rownames(boruta.confirmed_export)[i]])
+    colnames(important_features_int) <- rownames(boruta.confirmed_export)[i]
+    rownames(important_features_int) <- rownames(tdS_norm_ln)
+    
+    important_features_int <- merge(important_features_int, mappingfile, by = "row.names")
+    rownames(important_features_int) <- important_features_int$Row.names
+    important_features_int$Row.names <- NULL
+    
+    if(bool_barplot){
+    # barplot
+    pdf(paste(filepath,"plot_boruta/",title,".pdf",sep=""), height = 3.5, width = 7)
+    important_features_int_sort <- important_features_int[order(important_features_int$Probenart),]
+    barplot(important_features_int_sort[,1], ylim = c(0,20), main = title, ylab = "log(intensity)", 
+            cex.axis = 0.7, axisnames = FALSE, border = F, col = important_features_int_sort[,2], 
+            legend.text = unique(important_features_int_sort[,2], col = unique(important_features_int_sort[,2])))
+    dev.off()
+    }
+  
+    if(bool_boxplot){
+    # boxplot
+    ggplot(important_features_int, aes(x=as.factor(Probenart),y=important_features_int[,1])) +
+           geom_violin(fill="slateblue", alpha=0.2) +
+           xlab("Probenart") +
+           ylab("log(intenstiy)") +
+           ylim(c(0,20)) + 
+           ggtitle(title) +
+           theme_classic()
+    ggsave(paste(filepath,"plot_boruta/",title,"_violin",".pdf",sep=""), device = "pdf")
+    }
+  }
+}
+```
+
+# export boruta
+```{r export boruta}
+if(export_boruta)
+{
+  
+  dataSamples_normalized_boruta <- dataSamples_normalized[rownames(dataSamples_normalized) %in% rownames(boruta.confirmed_export), ]
+  dsnB <- merge(dataSamples_normalized_boruta, boruta.confirmed_export, by = "row.names" )
+  
+  # workaround to save the rownames from knime out 
+  rownames(dsnB) <- dsnB$Row.names
+  dsnB$Row.names <- NULL
+  
+  dsnB <- merge(dsnB, coeff_a, by = "row.names")
+  rownames(dsnB) <- dsnB$Row.names
+  dsnB$Row.names <- NULL
+  
+  dsnB <- dsnB[with(dsnB, order(dsnB$meanImp , decreasing = T)), ]
+  
+  roestPattern <- "_Roest_"
+  dsnB_röst <- dsnB[,grep(roestPattern,colnames(dsnB))]
+  dsnB_röst_kern <- dsnB_röst[,grep(kernPattern,colnames(dsnB_röst))]
+  dsnB_röst_schale <- dsnB_röst[,grep(schalePattern,colnames(dsnB_röst))]
+
+  dsnB_röst_kern$sd <- apply(dsnB_röst_kern, 1, sd, na.rm = T)
+  dsnB_röst_kern$rmean <- rowMeans(dsnB_röst_kern, na.rm = T)
+  dsnB_röst_kern$cv <- (dsnB_röst_kern$sd/dsnB_röst_kern$rmean) * 100
+  dsnB_röst_kern$n_NA <- apply(dsnB_röst_kern, 1, function(x) sum(is.na(x)))
+  
+  dsnB_röst_schale$sd <- apply(dsnB_röst_schale, 1, sd, na.rm = T)
+  dsnB_röst_schale$rmean <- rowMeans(dsnB_röst_schale, na.rm = T)
+  dsnB_röst_schale$cv <- (dsnB_röst_schale$sd/dsnB_röst_schale$rmean) * 100
+  dsnB_röst_schale$n_NA <- apply(dsnB_röst_schale, 1, function(x) sum(is.na(x)))
+
+  # calcuate rowmeans Kern Schale 
+  shellPattern <- ".\\dS_"
+  shell <- as.matrix(dsnB[, grep(shellPattern,colnames(dsnB))])
+  corePattern <- ".\\dK_"
+  core <- as.matrix(dsnB[, grep(corePattern,colnames(dsnB))])
+
+  dsnB["rowMean(Schale)"] <- rowMedians(shell,na.rm = T)
+  dsnB["rowMean(Kern)"] <- rowMedians(core,na.rm = T)
+  
+  dsnB["cv_roest_k"] <- dsnB_röst_kern$cv
+  dsnB["cv_roest_s"] <- dsnB_röst_schale$cv
+  dsnB["NA_roest_k"] <- dsnB_röst_kern$n_NA
+  dsnB["NA_roest_s"] <- dsnB_röst_schale$n_NA
+  
+  write.csv(dsnB,file = paste(filepath,"/summary/","analysis_boruta_maxruns1000_all_polar_pos",".csv",sep=""), fileEncoding = "UTF-16LE")
+  
+  print("export_boruta - Done")
+}
+```
+
+# randomForest as in Boruta (wo feature selection) 
+```{r randomForest like Boruta - recursive feature eliminiation}
+# see https://www.analyticsvidhya.com/blog/2016/03/select-important-variables-boruta-package/
+if(T)
+{
+  # rfe -> recursive feature elimination
+  set.seed(7)
+  
+  # has to check if package is loaded
+  if("caret" %in% (.packages()))
+  {
+    detach("package:caret", unload = T)
+  }
+  
+  library(caret)
+  
+  print("calculate: control")
+  # control function used with RFE algorithm
+  control <- rfeControl(functions = rfFuncs, method = "repeatedcv", number = 10, repeats = 5)
+  
+  print("calculate: randomForest")
+  #implement RFE algorithm
+  
+  rfe.train <- rfe(dftraining[ , -ncol(dftraining)], dftraining$Probenart, sizes=c(1, 25, 50 ,100 ,150, 500), rfeControl = control)
+  
+  print("caret - Done")
+  
+  rfe.predict <- predict(rfe.train, dftesting)
+  confusionMatrix(rfe.predict$pred, dftesting$Probenart)
+  
+  ########
+  
+  predictors(rfe.train)
+  
+  vimp_all <- varImp(rfe.train)
+  vimp_all$rownames <- rownames(vimp_all)
+
+  vimp <- varImp(rfe.train)
+  vimp$rownames <- rownames(vimp)
+  
+  vimp <- as.data.frame(vimp)
+  vimp <- head(vimp, top)
+  
+  print(rfe.train$fit)
+}
+```
+
+# boruta #2 - here boruta is only trained on the trainigsset. 
+```{r boruta-rf}
+# feature selection algorithm (wrapper around random forest)
+# An all relevant feature selection wrapper algorithm. It finds relevant features by comparing original attributes' importance with importance achievable at random,
+# estimated using their permuted copies.
+
+# install.packages("Boruta")
+if(T)
+{
+  set.seed(7)
+  
+  # has to check if randomForest is loaded shadow method
+  if("randomForest" %in% (.packages()))
+  {
+    detach("package:randomForest", unload = T)
+  }
+
+  library(Boruta)
+  
+  print("test performace")
+  # test performance 
+  boruta.train <- Boruta(factor(dftraining$Probenart) ~.,
+                         data = dftraining, 
+                         maxRuns = 1000, 
+                         doTrace = 2)
+  print(boruta.train)
+  
+  print("decision on tentative attributes")
+  # decision on tentative attributes
+  boruta.final <- TentativeRoughFix(boruta.train)
+  print(boruta.final)
+  
+  print("get Attributes")
+  # get Attributes
+  borutaVars <- getSelectedAttributes(boruta.final, withTentative = F)
+  
+  print("get Formula")
+  boruta.formula <- formula(paste("Probenart ~ ", 
+                                paste(borutaVars, collapse = " + ")))
+  
+  print("get boruta results")
+  # results
+  boruta.df <- attStats(boruta.final)   
+  
+  # extract features confirmed by boruta 
+  boruta.confirmed <- boruta.df[boruta.df$decision == "Confirmed",]
+  boruta.confirmed <- boruta.confirmed[order(-boruta.confirmed$meanImp),]
+  
+  #####
+  # https://www.kaggle.com/cdupin/using-boruta-feature-selection-wtih-random-forest
+  # add randomForest part to train on boruta output   
+  # set random forest parameter controls
+  
+  dftraining <- droplevels(dftraining)
+  
+  print("fitControl")
+  fitControl = trainControl(method = "repeatedcv",
+                          classProbs = TRUE,
+                          number = 10,
+                          repeats = 5, 
+                          index = createResample(dftraining$Probenart, 500),
+                          summaryFunction = twoClassSummary,
+                          verboseIter = FALSE)
+  
+  # run random forest 
+  set.seed(7)
+  print("run randomforest")
+  rfBoruta.fit <- train(boruta.formula, 
+                      data = dftraining, #maybe have to use whole dataset here? 
+                      trControl = fitControl,
+                      tuneLength = 4,  # final value was mtry = 4
+                      method = "rf",
+                      metric = "ROC")
+  
+  # test prediction
+  rfBoruta.predict <- predict(rfBoruta.fit, dftesting)
+  confusionMatrix(rfBoruta.predict, dftesting$Probenart)
+  
+print(rfBoruta.fit$finalModel)
+print(rfBoruta.predict)
+}
+```
+
+# SVM 
+```{r SVM}
+# http://dataaspirant.com/2017/01/19/support-vector-machine-classifier-implementation-r-caret-package/
+if(T)
+{
+  # svm support vector machine
+  set.seed(7)
+  
+  # has to check if package is loaded
+  if("caret" %in% (.packages()))
+  {
+    detach("package:caret", unload = T)
+  }
+  
+  library(caret)
+  dftraining <- droplevels(dftraining)
+  
+  print("calculate: control")
+  # control function used with RFE algorithm
+  
+  svmcontrol = trainControl(method = "repeatedcv", #cross validation
+                          number = 10,
+                          repeats = 5)
+
+  print("calculate: svm")
+  
+  #implement svm algorithm
+  svm.train <- train(Probenart ~.,
+                     data = dftraining,
+                     method = "svmLinear",
+                     trControl = svmcontrol) 
+  
+  control = trainControl(method = "repeatedcv", #cross validation
+                          classProbs = TRUE,  
+                          number = 10,
+                          repeats = 5, #do 5 repeats of cv
+                          index = createResample(dftraining$Probenart, 500),
+                          summaryFunction = twoClassSummary,
+                          verboseIter = FALSE)
+  
+  print("calculate randomForest")
+  # implement randomForest
+  print("calculate: RF")
+  rf.train <- train(Probenart ~.,
+              data = dftraining,
+              method = "rf",
+              metric = "ROC",
+              trControl = control)
+  
+  print("training - Done")
+  
+  print(svm.train$finalModel)
+  print(rf.train$finalModel)
+  
+  svm.predict <- predict(svm.train, dftesting)
+  confusionMatrix(svm.predict, dftesting$Probenart)
+  
+  rf.predict <- predict(rf.train, dftesting)
+  confusionMatrix(rf.predict, dftesting$Probenart)
+}
+```
+
+
+# Benchmarking Klassifikationsalgorithmen
+```{r Benchmarking}
+# RandomForest (recursive feature elimination)
+print("Recursive Feature Elimination")
+print(rfe.train)
+print(confusionMatrix(rfe.train))
+print(rfe.train$fit)
+print(confusionMatrix(rfe.predict$pred,dftesting$Probenart))
+
+# Boruta + RandomForest
+print("BorutaAndRandomForest")
+print(rfBoruta.fit)
+print(confusionMatrix(rfBoruta.fit))
+print(rfBoruta.fit$finalModel)
+print(confusionMatrix(rfBoruta.predict,dftesting$Probenart))
+
+# lineare SVM
+print("lineare SVM")
+print(svm.train)
+print(confusionMatrix(svm.train))
+print(svm.train$finalModel)
+print(confusionMatrix(svm.predict,dftesting$Probenart))
+
+# random Forest
+print("RandomForest")
+print(rf.train)
+print(confusionMatrix(rf.train))
+print(rf.train$finalModel)
+print(confusionMatrix(rf.predict,dftesting$Probenart))
+```
+
+# Plot "Röstreihe" 
+```{r}
+roestPattern <- "_Roest_"
+dsnB_röst <- dsnB[,grep(roestPattern,colnames(dsnB))]
+
+dsnB_röst_kern <- dsnB_röst[,grep(kernPattern,colnames(dsnB_röst))]
+dsnB_röst_schale <- dsnB_röst[,grep(schalePattern,colnames(dsnB_röst))]
+
+dsnB_röst_sort <- cbind(dsnB_röst_kern, dsnB_röst_schale)
+
+if(bool_boxplot || bool_barplot){
+    for (i in 1:length(rownames(dsnB_röst))){
+    title <- rownames(dsnB_röst)[i]
+    
+    feature <- as.matrix(dsnB_röst[i,])
+    
+    newcolnames <- colnames(feature)
+    
+    # shorten colnames for better visualization
+    split <- strsplit(colnames(feature),"_")
+    
+    for (i in 1:length(colnames(feature)))
+    {
+      newcolnames[i] <- split[i][[1]][4]
+    }
+    
+    colnames(feature) <- newcolnames
+    
+    if(bool_barplot){
+    # barplot
+    pdf(paste(filepath,"plot_boruta_Röst/",title,".pdf",sep=""), height = 3.5, width = 7)
+    barplot(feature, main = title, ylab = "intensity", 
+            cex.axis = 0.7, axisnames = TRUE, border = F, las = 2, cex.names = 0.7)
+    dev.off()
+    }
+  }
+}
+```
+
+# export rfe
+```{r export rfe}
+if(T)
+{
+  dsnrfe <- dataSamples_normalized[rownames(dataSamples_normalized) %in% predictors(rfe.train), ]
+
+  dsnrfe <- merge(dsnrfe, coeff_a, by = "row.names")
+  rownames(dsnrfe) <- dsnrfe$Row.names
+  dsnrfe$Row.names <- NULL
+
+  # calcuate rowmeans Kern Schale 
+  shellPattern <- "\\dS_"
+  shell <- as.matrix(dsnrfe[, grep(shellPattern,colnames(dsnrfe))])
+  corePattern <- "\\dK_"
+  core <- as.matrix(dsnrfe[, grep(corePattern,colnames(dsnrfe))])
+
+  dsnrfe["rowMean(Schale)"] <- rowMedians(shell,na.rm = T)
+  dsnrfe["rowMean(Kern)"] <- rowMedians(core,na.rm = T)
+  
+  write.csv(dsnrfe,file = paste(filepath,"/summary/","polar_pos_rfe",".csv",sep=""), fileEncoding = "UTF-16LE")
+  
+  print("export_rfe - Done")
+}
+```
+
+# overlap classficiation algorithms
+```{r}
+library(gplots)
+
+length(rfe.train)
+length(predictors(rf.train))
+nrow(boruta.confirmed)
+
+v.table <- venn(list("boruta"=rownames(boruta.confirmed), "rfe" = predictors(rfe.train), "rf" = predictors(rf.train)))
+
+print(v.table)
+
+if(T)
+{
+  png("~/Desktop/venn_polar_positiv__chrom40_int600.png", width = 20, height = 20, units = "cm", res = 300)
+  plot(v.table)
+  title(main = "Überlapp verschiedener Klassifikationen (polar positiv)")
+  dev.off()
+}
+```
+
