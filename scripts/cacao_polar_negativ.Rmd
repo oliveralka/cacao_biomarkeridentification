@@ -20,6 +20,8 @@ library(ggfortify)
 library(devtools)
 library(ggbiplot)
 library(robustbase)
+library(factoextra)
+library(taRifx)
 ```
 
 # paramters 
