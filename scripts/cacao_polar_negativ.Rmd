@@ -6,7 +6,7 @@ output:
   pdf_document: default
 ---
 
-This script can be used for the analysis and the random forest of one specific group (polar_positiv, polar_negativ, ...)
+This script can be used for the analysis (classficiation) of one specific sample group (polar_positiv, polar_negativ, ...)
 
 In this case the sript was used for unpolar_positiv data. 
 
