@@ -27,16 +27,16 @@ library(taRifx)
 # paramters 
 ```{r param}
 # folder with data
-filepath <- "/Volumes/Transfer/20180503_cacao/analyse_2/polar_negativ/"
+filepath <- "path to input directory"
 
 # from ExtractConsensusXML (KNIME)
-inputfile <- "centroided_QEKFQ786AC_Blank_NTP_Neg_RA1_01_2501_to_centroided_QEKFQ916A9_Roest_7_mrgd.csv"
+inputfile <- "filename (.csv)"
 
 # from getNamesConsensusXML (python)
-barcodefile <- "centroided_QEKFQ786AC_Blank_NTP_Neg_RA1_01_2501_to_centroided_QEKFQ916A9_Roest_7_mrgd_python_names.csv"
+barcodefile <- "filename_python_names (.csv)"
 
 # file with barcodes and metadata used for metadata-registration
-registrationfile <- "Herkunftsproben+und+Röstreihe+NTP+neg_with_barcodes.tsv"
+registrationfile <- "registrationfile_with_barcodes (.tsv)"
 
 # mapping with "type" for pca and randomforest
 # please name the ID column: all
