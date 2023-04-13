@@ -1,0 +1,161 @@
+---
+title: "cacao_regression"
+author: "Oliver Alka"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# packages
+```{r packages, include=TRUE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(caret)
+```
+
+# parameter
+```{r param}
+# path to analysis directory 
+filepath <- ""
+
+# file with calibration data (Concentration, Intensity1 (metabolite1), Intensity2 (metabolite2), ...)
+calibration <- ""
+
+# output directories
+output_plot <- paste(filepath, "lm_plot/" , sep="")
+output_write <- paste(filepath, "output_write/" , sep="")
+
+# output options
+write_results <- F
+plot_save <- F
+```
+
+# input
+```{r input}
+input <- read.csv(paste(filepath, calibration , sep=""), header = TRUE, row.names = 1, stringsAsFactors = FALSE)
+```
+
+```{r plot metabolites}
+
+ggplot_input <- gather(input, key="metabolites", value="Intensität", -Konzentration)
+p <- ggplot(ggplot_input, aes(x=Konzentration,y=Intensität)) +
+     geom_point() +
+     facet_wrap(~metabolites,scales = "free_y", ncol = 4) + 
+     geom_smooth(method='lm', formula=y~x) +
+     xlab("cocoa shell [%]") +
+     ylab("area [skt.]") 
+
+p 
+
+if(plot_save)
+{
+  ggsave(paste(output_plot,"GLS_metabolites.png", sep = ""), plot = p, scale = 0.65, units = "cm", dpi = 600)
+} 
+```
+
+# testing using sparse partial least squares
+```{r testing using sparse partial least squares}
+# train on calibration set and test with realdata
+data_wo_outlier <- input
+
+library(skimr)
+skimmed_data <- skim_to_wide(data_wo_outlier)
+
+# train with 10-fold cross validation (10 repetitions)
+train_control <- trainControl(method = "repeatedcv", number = 10, repeats = 10)
+
+c_spls <- train(Konzentration ~ .,
+                data = data_wo_outlier,
+                trControl = train_control,
+                preProc= c("center","scale"),
+                method = "spls",
+                tuneLength = 15)
+
+predict(c_spls, data_wo_outlier, se.fit=T)
+prediction <- data.frame(predict(c_spls, data_wo_outlier, se.fit=T))
+
+library(tibble)
+prediction_wR <- rownames_to_column(prediction, var="name")
+
+library(tidyr)
+prediction_wR <- prediction_wR %>% separate(name, c("names", "replicate")) 
+prediction_wR$replicate <- NULL
+colnames(prediction_wR) <- c("names","observed")
+
+prediction_agg <- aggregate(prediction_wR, by=list(prediction_wR$names),  function(x) c(mean = mean(x), sd = sd(x)))
+prediction_agg$names <- NULL
+prediction_agg <- do.call("data.frame", prediction_agg)
+prediction_agg["target"] <- input$Konzentration[rownames(input) %in% rownames(prediction_test_once_wR)]
+
+# absolute error (difference of prediction vs target value)
+prediction_agg["diff"] <- abs(prediction_agg[,"observed.mean"]-prediction_agg[,"target"])
+prediction_agg["error_prop"] <- sqrt((prediction_agg[,"observed.sd"]^2+prediction_agg["diff"]^2))
+prediction_agg["relative_error"] <- (abs(prediction_agg[,"observed.mean"]-prediction_agg[,"target"]))/prediction_agg[,"target"]
+
+```
+
+```{r validation - training and testset}
+data_wo_outlier <- input
+
+set.seed(1)
+
+random_test <- data.frame()
+random_test_scores <- data.frame()
+
+# repeat 5 times, once for each replicate
+for (i in seq(1:5)){ 
+  print(i)
+  # sample over the replicates (leave each replicate out and calculate absolute and relative error - afterwards use the SD on the error)
+  data_wo_outlier_wR <- rownames_to_column(data_wo_outlier, var="name")
+
+  library(tidyr)
+  data_wo_outlier_wR_split <- data_wo_outlier_wR %>% separate(name, c("names", "replicate")) 
+  testset <- data_wo_outlier_wR_split[data_wo_outlier_wR_split$replicate == i,]
+  
+  training <- data_wo_outlier[ !(rownames(data_wo_outlier_wR_split) %in% rownames(testset)) ,]
+  testing  <- data_wo_outlier[ (rownames(data_wo_outlier_wR_split) %in% rownames(testset)) ,]
+  
+  # control
+  # model parameter opitmization on the training data
+  train_control <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+  
+  # on training only
+  c_spls_train<- train(Konzentration ~ .,
+                  data = training,
+                  trControl = train_control,
+                  preProc= c("center","scale"),
+                  method = "spls",
+                  tuneGrid = data.frame(K = 2, eta = 0.9, kappa = 0.5))
+  
+  print(c_spls_train)
+  
+  test_prediction <- data.frame(predict(c_spls_train, tcesting, se.fit=T))
+  
+  test_prediction_copy <- test_prediction
+  test_prediction_copy["target"] <- input$Konzentration[rownames(input) %in% rownames(test_prediction_copy)]
+  colnames(test_prediction_copy) <- c("predicted", "target")
+  
+  # absolute error (difference of prediction vs target value)
+  test_prediction_copy["diff"] <- abs(test_prediction_copy[,"predicted"]-test_prediction_copy[,"target"])
+  # relative error
+  test_prediction_copy["relative_error"] <- (abs(test_prediction_copy[,"predicted"]-test_prediction_copy[,"target"]))/test_prediction_copy[,"target"]
+
+  random_test <- rbind(random_test, test_prediction)
+  random_test_scores <- rbind(random_test_scores, test_prediction_copy)
+
+}
+  prediction_test_wR <- rownames_to_column(random_test_scores, var="name")
+  prediction_test_wR <- prediction_test_wR %>% separate(name, c("names", "replicate")) 
+  prediction_test_wR$replicate <- NULL
+  colnames(prediction_test_wR) <- c("names","predicted","target","abs_error","relative_error")
+  
+  prediction_test_agg <- aggregate(prediction_test_wR, by=list(prediction_test_wR$names),  function(x) c(mean = mean(x), sd = sd(x)))
+  prediction_test_agg$names <- NULL
+  prediction_test_agg <- do.call("data.frame", prediction_test_agg)
+  
+if(write_results)
+{
+  write.csv(prediction_test_agg, file=paste(output_write, "output.tsv", seq = ""))
+}
+```
